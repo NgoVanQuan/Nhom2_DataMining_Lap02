@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 from scipy import stats
-from mlxtend.frequent_patterns import apriori, association_rules
+from mlxtend.frequent_patterns import apriori, fpgrowth, association_rules
 from sklearn.preprocessing import StandardScaler
 import plotly.express as px
 import networkx as nx
@@ -434,9 +434,240 @@ class AssociationRulesMiner:
         rules_df.to_csv(output_path, index=False)
         print(f"Đã lưu luật vào: {output_path}")
 
+# =========================================================
+# 4. FP-GROWTH ASSOCIATION RULES MINER
+# =========================================================
+
+
+class FPGrowthMiner:
+    """
+    A class for mining association rules using the FP-Growth algorithm.
+
+    Interface được thiết kế tương tự AssociationRulesMiner (Apriori)
+    để dễ tái sử dụng và so sánh.
+    """
+
+    def __init__(self, basket_bool: pd.DataFrame):
+        """
+        Initialize the FPGrowthMiner with basket data.
+
+        Args:
+            basket_bool (pd.DataFrame): Boolean encoded basket dataframe
+        """
+        self.basket_bool = basket_bool
+        self.frequent_itemsets = None
+        self.rules = None
+
+    def mine_frequent_itemsets(
+        self,
+        min_support: float = 0.01,
+        max_len: int = None,
+        use_colnames: bool = True,
+    ) -> pd.DataFrame:
+        """
+        Mine frequent itemsets using the FP-Growth algorithm.
+
+        Args:
+            min_support (float): Ngưỡng support tối thiểu.
+            max_len (int | None): Độ dài tối đa của itemset.
+            use_colnames (bool): True nếu muốn itemsets dùng tên cột.
+
+        Returns:
+            pd.DataFrame: DataFrame of frequent itemsets
+        """
+        fi = fpgrowth(
+            self.basket_bool,
+            min_support=min_support,
+            use_colnames=use_colnames,
+            max_len=max_len,
+        )
+        fi.sort_values(by="support", ascending=False, inplace=True)
+        self.frequent_itemsets = fi
+        return self.frequent_itemsets
+
+    def generate_rules(
+        self,
+        metric: str = "lift",
+        min_threshold: float = 1.0,
+    ) -> pd.DataFrame:
+        """
+        Generate association rules from frequent itemsets.
+
+        Args:
+            metric (str): Metric to evaluate the rules
+            min_threshold (float): Minimum threshold for the metric
+
+        Returns:
+            pd.DataFrame: DataFrame of association rules
+        """
+        if self.frequent_itemsets is None:
+            raise ValueError(
+                "Frequent itemsets not mined. "
+                "Please run mine_frequent_itemsets() first."
+            )
+
+        rules = association_rules(
+            self.frequent_itemsets,
+            metric=metric,
+            min_threshold=min_threshold,
+        )
+        rules = rules.sort_values(["lift", "confidence"], ascending=False)
+        self.rules = rules
+        return self.rules
+
+    @staticmethod
+    def _frozenset_to_str(fs: frozenset) -> str:
+        return ", ".join(sorted(list(fs)))
+
+    def add_readable_rule_str(self) -> pd.DataFrame:
+        """
+        Add human-readable columns for antecedents, consequents, and rule_str
+        to the rules dataframe.
+
+        Returns:
+            pd.DataFrame: Rules dataframe with extra readable columns
+        """
+        if self.rules is None:
+            raise ValueError("rules is not available. Call generate_rules() first.")
+
+        rules = self.rules.copy()
+        rules["antecedents_str"] = rules["antecedents"].apply(self._frozenset_to_str)
+        rules["consequents_str"] = rules["consequents"].apply(self._frozenset_to_str)
+        rules["rule_str"] = rules["antecedents_str"] + " → " + rules["consequents_str"]
+        self.rules = rules
+        return self.rules
+
+    def filter_rules(
+        self,
+        min_support: float = None,
+        min_confidence: float = None,
+        min_lift: float = None,
+        max_len_antecedents: int = None,
+        max_len_consequents: int = None,
+    ) -> pd.DataFrame:
+        """
+        Filter rules based on support, confidence, lift and length of
+        antecedents/consequents.
+        """
+        if self.rules is None:
+            raise ValueError("rules is not available. Call generate_rules() first.")
+
+        filtered = self.rules.copy()
+
+        if min_support is not None:
+            filtered = filtered[filtered["support"] >= min_support]
+        if min_confidence is not None:
+            filtered = filtered[filtered["confidence"] >= min_confidence]
+        if min_lift is not None:
+            filtered = filtered[filtered["lift"] >= min_lift]
+
+        if max_len_antecedents is not None:
+            filtered = filtered[
+                filtered["antecedents"].apply(len) <= max_len_antecedents
+            ]
+        if max_len_consequents is not None:
+            filtered = filtered[
+                filtered["consequents"].apply(len) <= max_len_consequents
+            ]
+
+        filtered = filtered.reset_index(drop=True)
+        return filtered
+
+    def save_rules(self, output_path: str, rules_df: pd.DataFrame = None):
+        """
+        Save rules dataframe to CSV.
+
+        Args:
+            output_path (str): CSV path
+            rules_df (pd.DataFrame): Rules dataframe to save
+                (if None, use self.rules)
+        """
+        if rules_df is None:
+            if self.rules is None:
+                raise ValueError("No rules to save.")
+            rules_df = self.rules
+
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        rules_df.to_csv(output_path, index=False)
+        print(f"Đã lưu luật vào: {output_path}")
 
 # =========================================================
-# 4. DATA VISUALIZER (EDA + RFM + APRIORI)
+# 5. APRIORI vs FP-GROWTH COMPARISON HELPERS
+# =========================================================
+
+
+def benchmark_apriori_vs_fpgrowth(
+    basket_bool: pd.DataFrame,
+    min_support: float = 0.01,
+    max_len: int = None,
+    metric: str = "lift",
+    min_threshold: float = 1.0,
+) -> dict:
+    """
+    Chạy cả Apriori và FP-Growth trên cùng một basket_bool, đo thời gian
+    và trả về summary để phục vụ so sánh trong notebook.
+
+    Returns:
+        dict với các keys:
+            - "summary": pd.DataFrame với các cột:
+                ['algorithm', 'runtime_sec', 'n_itemsets',
+                 'n_rules', 'avg_itemset_length']
+            - "apriori_itemsets": frequent itemsets từ Apriori
+            - "apriori_rules": rules từ Apriori
+            - "fpgrowth_itemsets": frequent itemsets từ FP-Growth
+            - "fpgrowth_rules": rules từ FP-Growth
+    """
+    # --- Apriori ---
+    apriori_miner = AssociationRulesMiner(basket_bool=basket_bool)
+    t0 = time.time()
+    fi_ap = apriori_miner.mine_frequent_itemsets(
+        min_support=min_support,
+        max_len=max_len,
+        use_colnames=True,
+    )
+    rules_ap = apriori_miner.generate_rules(metric=metric, min_threshold=min_threshold)
+    t_ap = time.time() - t0
+
+    avg_len_ap = (
+        fi_ap["itemsets"].apply(len).mean() if not fi_ap.empty else 0.0
+    )
+
+    # --- FP-Growth ---
+    fpg_miner = FPGrowthMiner(basket_bool=basket_bool)
+    t0 = time.time()
+    fi_fp = fpg_miner.mine_frequent_itemsets(
+        min_support=min_support,
+        max_len=max_len,
+        use_colnames=True,
+    )
+    rules_fp = fpg_miner.generate_rules(metric=metric, min_threshold=min_threshold)
+    t_fp = time.time() - t0
+
+    avg_len_fp = (
+        fi_fp["itemsets"].apply(len).mean() if not fi_fp.empty else 0.0
+    )
+
+    summary = pd.DataFrame(
+        {
+            "algorithm": ["apriori", "fpgrowth"],
+            "runtime_sec": [t_ap, t_fp],
+            "n_itemsets": [len(fi_ap), len(fi_fp)],
+            "n_rules": [len(rules_ap), len(rules_fp)],
+            "avg_itemset_length": [avg_len_ap, avg_len_fp],
+        }
+    )
+
+    return {
+        "summary": summary,
+        "apriori_itemsets": fi_ap,
+        "apriori_rules": rules_ap,
+        "fpgrowth_itemsets": fi_fp,
+        "fpgrowth_rules": rules_fp,
+    }
+
+
+# =========================================================
+# 6. DATA VISUALIZER (EDA + RFM + ASSOCIATION RULES)
 # =========================================================
 
 class DataVisualizer:
